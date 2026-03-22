@@ -42,16 +42,16 @@ from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.parts.image import Image
 from pptx.enum.text import MSO_AUTO_SIZE
 from io import BytesIO
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem, Image as ReportLabImage
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem, Image as ReportLabImage, Table as ReportLabTable, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_LEFT
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.lib.units import mm
 
 #NonDockerImport
 import asyncio
 import uvicorn
-from typing import Any
+from typing import Any, List, Iterable, cast
 from mcp.server.sse import SseServerTransport
 from starlette.requests import Request
 from starlette.applications import Starlette
@@ -88,6 +88,8 @@ XLSX_TEMPLATE = None
 PPTX_TEMPLATE_PATH = None
 DOCX_TEMPLATE_PATH = None
 XLSX_TEMPLATE_PATH = None
+
+TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?(?:\s*:?-+:?\s*\|)+\s*$")
 
 if DOCS_TEMPLATE_PATH and os.path.exists(DOCS_TEMPLATE_PATH):
     logging.debug(f"Template Folder: {DOCS_TEMPLATE_PATH}")
@@ -402,6 +404,49 @@ styles.add(ParagraphStyle(
     topPadding=5,
     bottomPadding=5
 ))
+styles.add(ParagraphStyle(
+    name="StructuredDocumentTitle",
+    parent=styles["CustomHeading1"],
+    fontSize=24,
+    leading=28,
+    alignment=TA_LEFT,
+    spaceBefore=0,
+    spaceAfter=18
+))
+styles.add(ParagraphStyle(
+    name="StructuredParagraph",
+    parent=styles["CustomNormal"],
+    leading=16,
+    spaceBefore=4,
+    spaceAfter=10
+))
+styles.add(ParagraphStyle(
+    name="StructuredListItem",
+    parent=styles["CustomListItem"],
+    leftIndent=6,
+    spaceBefore=2,
+    spaceAfter=2
+))
+styles.add(ParagraphStyle(
+    name="StructuredSourcesHeading",
+    parent=styles["CustomHeading2"],
+    textColor=colors.HexColor("#1F3474"),
+    fontSize=13,
+    leading=16,
+    alignment=TA_LEFT,
+    spaceBefore=18,
+    spaceAfter=6
+))
+styles.add(ParagraphStyle(
+    name="StructuredSourcesItem",
+    parent=styles["CustomNormal"],
+    fontSize=10,
+    italic=True,
+    leading=14,
+    leftIndent=4,
+    spaceBefore=2,
+    spaceAfter=4
+))
 
 def render_text_with_emojis(text: str) -> str:
     if not text:
@@ -437,7 +482,7 @@ def process_list_items(ul_or_ol_element, is_ordered=False):
             nested_items = process_list_items(sub_list, is_sub_ordered)
             if nested_items:
                 nested_list_flowable = ListFlowable(
-                    nested_items,
+                    cast(Iterable, nested_items),
                     bulletType='1' if is_sub_ordered else 'bullet',
                     leftIndent=10 * mm,
                     bulletIndent=5 * mm,
@@ -514,7 +559,7 @@ def render_html_elements(soup):
                 items = process_list_items(elem, is_ordered)
                 if items:
                     log.debug(f"Adding ListFlowable with {len(items)} items")
-                    story.append(ListFlowable(items,
+                    story.append(ListFlowable(cast(Iterable, items),
                         bulletType='1' if is_ordered else 'bullet',
                         leftIndent=10 * mm,
                         bulletIndent=5 * mm,
@@ -603,6 +648,514 @@ def render_html_elements(soup):
     log.debug(f"Finished render_html_elements. Story contains {len(story)} elements.")
     return story
 
+
+def _extract_structured_content(payload: Any) -> list[Any] | None:
+    if isinstance(payload, dict) and payload.get("type"):
+        return [payload]
+    if isinstance(payload, list):
+        structured_hint = any(isinstance(item, dict) and item.get("type") for item in payload)
+        if structured_hint:
+            return payload
+    return None
+
+
+def render_structured_content(structured_blocks: list[Any]) -> list:
+    renderer = _StructuredContentRenderer()
+    return renderer.build(structured_blocks)
+
+
+def flatten_structured_blocks(blocks: list[Any] | None, depth: int = 1) -> list[tuple[Any, int]]:
+    if not blocks:
+        return []
+    flattened: list[tuple[Any, int]] = []
+    for block in blocks:
+        flattened.append((block, depth))
+        if isinstance(block, dict):
+            child_depth = depth + 1 if (block.get("type") or "").strip().lower() == "section" else depth
+            children = block.get("children")
+            if isinstance(children, list) and children:
+                flattened.extend(flatten_structured_blocks(children, child_depth))
+    return flattened
+
+
+_PARAGRAPH_TYPES = {"paragraph", "text", "body", "description", "summary", "heading", "subheading", "title"}
+
+
+def _normalize_markup_text(value: Any) -> tuple[str, str]:
+    if value is None:
+        return "", ""
+    text = str(value)
+    html = markdown2.markdown(text, extras=["fenced-code-blocks"])
+    soup = BeautifulSoup(html, "html.parser")
+    allowed = {"strong", "b", "em", "i", "br"}
+    for tag in soup.find_all():
+        if tag.name not in allowed and tag.name != "body":
+            tag.unwrap()
+    body = soup.body
+    formatted = ""
+    if body:
+        formatted = "".join(str(child) for child in body.children)
+    else:
+        formatted = str(soup)
+    plain = soup.get_text(" ", strip=True)
+    return plain, formatted
+
+
+def _strip_wrapping_paragraph_tags(html: str) -> str:
+    if not html:
+        return ""
+    trimmed = html.strip()
+    stripped = re.sub(r"(?i)^<p>(.*?)</p>$", r"\1", trimmed, flags=re.S)
+    return stripped.strip()
+
+
+def _parse_paragraph_segments(raw_text: str) -> list[dict]:
+    segments = []
+    if not raw_text:
+        return segments
+    bullet_re = re.compile(r"^(?:[•\*-])\s+(.*)")
+    label_re = re.compile(r"^\*\*(.+?):\*\*\s*(.*)")
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    for line in lines:
+        bullet_match = bullet_re.match(line)
+        if bullet_match:
+            inner = bullet_match.group(1)
+            plain, formatted = _normalize_markup_text(inner)
+            formatted = _strip_wrapping_paragraph_tags(formatted)
+            if plain:
+                segments.append({"type": "bullet", "text": plain, "formatted": formatted})
+            continue
+        label_match = label_re.match(line)
+        if label_match:
+            label_text = label_match.group(1).strip()
+            label_value = f"{label_text}:"
+            label_source = f"**{label_value}**"
+            plain_label, formatted_label = _normalize_markup_text(label_source)
+            formatted_label = _strip_wrapping_paragraph_tags(formatted_label)
+            rest = label_match.group(2).strip()
+            rest_plain, rest_formatted = _normalize_markup_text(rest)
+            rest_formatted = _strip_wrapping_paragraph_tags(rest_formatted)
+            if plain_label:
+                segments.append({
+                    "type": "label",
+                    "label": label_value,
+                    "formatted_label": formatted_label,
+                    "text": rest_plain,
+                    "formatted_text": rest_formatted,
+                })
+            elif rest_plain:
+                segments.append({"type": "paragraph", "text": rest_plain, "formatted": rest_formatted})
+            continue
+        plain, formatted = _normalize_markup_text(line)
+        formatted = _strip_wrapping_paragraph_tags(formatted)
+        if plain:
+            segments.append({"type": "paragraph", "text": plain, "formatted": formatted})
+    return segments
+
+
+def _collect_nested_child_blocks(item: dict) -> list[Any]:
+    nested: list[Any] = []
+    for key in ("children", "content", "blocks"):
+        value = item.get(key)
+        if isinstance(value, dict):
+            nested.append(value)
+        elif isinstance(value, list):
+            nested.extend(value)
+    return nested
+
+
+def _expand_paragraph_block(block: dict) -> list[dict]:
+    segments = block.get("segments") or []
+    child_blocks = block.get("children")
+    if not segments:
+        fallback = dict(block)
+        fallback.pop("segments", None)
+        return [fallback]
+
+    semantic_blocks: list[dict] = []
+    bullet_buffer: list[dict] = []
+
+    def flush_bullets() -> None:
+        nonlocal bullet_buffer
+        if not bullet_buffer:
+            return
+        semantic_blocks.append({"type": "bullet_list", "items": [dict(item) for item in bullet_buffer]})
+        bullet_buffer = []
+
+    for segment in segments:
+        seg_type = segment.get("type")
+        if seg_type == "bullet":
+            text = segment.get("text") or ""
+            formatted = segment.get("formatted") or text
+            if text:
+                bullet_buffer.append({"text": text, "formatted": formatted})
+            continue
+        flush_bullets()
+        if seg_type == "label":
+            label_block: dict = {
+                "type": "label_paragraph",
+                "label": segment.get("label"),
+                "formatted_label": segment.get("formatted_label"),
+            }
+            rest_text = segment.get("text")
+            if rest_text:
+                label_block["text"] = rest_text
+            rest_formatted = segment.get("formatted_text")
+            if rest_formatted:
+                label_block["formatted"] = rest_formatted
+            semantic_blocks.append(label_block)
+            continue
+        paragraph_text = segment.get("text")
+        if paragraph_text:
+            paragraph_block: dict = {"type": "paragraph", "text": paragraph_text}
+            paragraph_formatted = segment.get("formatted")
+            if paragraph_formatted:
+                paragraph_block["formatted"] = paragraph_formatted
+            semantic_blocks.append(paragraph_block)
+    flush_bullets()
+
+    if not semantic_blocks:
+        fallback = dict(block)
+        fallback.pop("segments", None)
+        return [fallback]
+
+    if child_blocks and semantic_blocks:
+        semantic_blocks[-1]["children"] = child_blocks
+
+    return semantic_blocks
+
+
+def _finalize_normalized_block(block: dict) -> list[dict]:
+    candidate = dict(block)
+    block_type = (candidate.get("type") or "").strip().lower()
+    if block_type in _PARAGRAPH_TYPES:
+        return _expand_paragraph_block(candidate)
+    candidate.pop("segments", None)
+    return [candidate]
+
+
+def normalize_content_for_export(content: Any) -> list[dict]:
+    def normalize_item(item: Any) -> list[dict]:
+        if item is None:
+            return []
+        if isinstance(item, str):
+            structured = _convert_markdown_to_structured(item)
+            normalized_blocks: list[dict] = []
+            for block in structured:
+                normalized_block = dict(block)
+                if normalized_block.get("text"):
+                    plain, formatted = _normalize_markup_text(normalized_block["text"])
+                    normalized_block["text"] = plain
+                    normalized_block["formatted"] = formatted
+                    if normalized_block["type"] in _PARAGRAPH_TYPES:
+                        normalized_block["segments"] = _parse_paragraph_segments(plain)
+                if normalized_block.get("type") == "table":
+                    table_data = normalized_block.get("data") or []
+                    normalized_block["data"] = _normalize_table_rows(table_data)
+                normalized_blocks.extend(_finalize_normalized_block(normalized_block))
+            return normalized_blocks
+        if isinstance(item, dict):
+            normalized: dict = {}
+            item_type = (item.get("type") or "").strip().lower()
+
+            if not item_type:
+                if item.get("items"):
+                    item_type = "list"
+                elif item.get("cells") or item.get("rows") or item.get("table"):
+                    item_type = "table"
+                else:
+                    item_type = "paragraph"
+
+            normalized["type"] = item_type
+
+            child_sources = _collect_nested_child_blocks(item)
+            text_value = _extract_block_text(item)
+            if item_type in _PARAGRAPH_TYPES and not text_value and child_sources:
+                return normalize_list(child_sources)
+
+            if item_type == "table":
+                data = item.get("data") or item.get("rows") or item.get("cells")
+                normalized["data"] = data if isinstance(data, list) else []
+            else:
+                raw_source = item.get("text") or item.get("title") or item.get("content") or ""
+                normalized_plain, normalized_formatted = _normalize_markup_text(raw_source)
+                if normalized_plain:
+                    normalized["text"] = normalized_plain
+                    normalized["formatted"] = normalized_formatted
+                    normalized["raw_text"] = raw_source
+                    if item_type in _PARAGRAPH_TYPES:
+                        normalized["segments"] = _parse_paragraph_segments(raw_source)
+
+            if child_sources:
+                nested_children = normalize_list(child_sources)
+                if nested_children:
+                    normalized["children"] = nested_children
+
+            if item_type == "list" and item.get("items"):
+                normalized["items"] = []
+                for list_entry in item.get("items") or []:
+                    entry_plain, entry_formatted = _normalize_markup_text(list_entry)
+                    if entry_plain:
+                        normalized["items"].append({"text": entry_plain, "formatted": entry_formatted})
+            if item_type == "table":
+                table_rows = item.get("data") or item.get("rows") or item.get("cells")
+                normalized["data"] = _normalize_table_rows(table_rows)
+            return _finalize_normalized_block(normalized)
+        if isinstance(item, list):
+            return normalize_list(item)
+        plain, formatted = _normalize_markup_text(item)
+        if not plain:
+            return []
+        fallback_block = {"type": "paragraph", "text": plain, "formatted": formatted}
+        fallback_block["segments"] = _parse_paragraph_segments(plain)
+        return _finalize_normalized_block(fallback_block)
+
+    def normalize_list(items: list[Any] | None) -> list[dict]:
+        if not isinstance(items, list):
+            return []
+        result: list[dict] = []
+        for child in items:
+            result.extend(normalize_item(child))
+        return result
+
+    return normalize_item(content)
+
+
+def _normalize_table_rows(data: Any) -> list[list[str]]:
+    rows: list[list[str]] = []
+    if not isinstance(data, list):
+        return rows
+    for row in data:
+        if isinstance(row, dict):
+            cell_values = row.get("cells") or row.get("data") or row.get("row") or []
+        elif isinstance(row, list):
+            cell_values = row
+        else:
+            cell_values = [row]
+        cells: list[str] = []
+        for cell in cell_values:
+            plain, _ = _normalize_markup_text(cell)
+            cells.append(plain)
+        if cells:
+            rows.append(cells)
+    return rows
+
+
+class _StructuredContentRenderer:
+    def __init__(self):
+        self.story: list[Any] = []
+        self.section_counters: list[int] = []
+
+    def build(self, blocks: list[Any]) -> list[Any]:
+        for block, depth in flatten_structured_blocks(blocks):
+            self._render_block(block, depth)
+        if not self.story:
+            self.story.append(Paragraph("Empty Content", styles["CustomNormal"]))
+        return self.story
+
+    def _render_block(self, block: Any, section_depth: int) -> None:
+        if isinstance(block, str):
+            self._append_paragraph(block)
+            return
+        if not isinstance(block, dict):
+            return
+
+        block_type = (block.get("type") or "").strip().lower()
+
+        if block_type == "title":
+            self._render_title(block)
+            return
+
+        if block_type == "section":
+            self._render_section(block, section_depth)
+            return
+
+        if block_type == "table":
+            table_data = block.get("data") or []
+            if table_data:
+                table = ReportLabTable(table_data, repeatRows=1)
+                table.setStyle(TableStyle([
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#9AA0B6")),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F0F3FF")),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ]))
+                self.story.append(table)
+                self.story.append(Spacer(1, 12))
+            return
+
+        if block_type == "label_paragraph":
+            self._render_label_paragraph(block)
+            return
+
+        if block_type in {"paragraph", "text", "body", "description", "summary", "heading", "subheading"}:
+            self._append_paragraph(block.get("text"), block.get("formatted"))
+            return
+        elif block_type in {"sources", "source", "references"}:
+            self._render_sources(block)
+            return
+        elif "list" in block_type or "bullet" in block_type:
+            list_flowable = self._build_list_flowable(block, depth=section_depth)
+            if list_flowable is not None:
+                self.story.append(list_flowable)
+                self.story.append(Spacer(1, 10))
+            return
+        else:
+            text = self._extract_text(block)
+            self._append_paragraph(text, self._extract_formatted(block))
+
+
+    def _render_title(self, block: dict) -> None:
+        text = self._extract_text(block)
+        if text:
+            paragraph = Paragraph(render_text_with_emojis(text), styles["StructuredDocumentTitle"])
+            self.story.append(paragraph)
+
+    def _render_section(self, block: dict, depth: int) -> None:
+        heading_text = self._extract_text(block, keys=("title", "text", "heading"))
+        heading_text = heading_text or "Untitled Section"
+        numbering = self._increment_section_counter(depth)
+        omit_numbering = bool(re.match(r"^\s*\d+[\.)]", heading_text))
+        display_text = heading_text if omit_numbering else (f"{numbering} {heading_text}" if numbering else heading_text)
+        paragraph = Paragraph(render_text_with_emojis(display_text), self._heading_style(depth))
+        self.story.append(paragraph)
+        self.story.append(Spacer(1, 16))
+
+    def _render_sources(self, block: dict) -> None:
+        heading = block.get("title") or block.get("text") or "Sources"
+        self.story.append(Paragraph(render_text_with_emojis(heading), styles["StructuredSourcesHeading"]))
+        entries = self._extract_list_entries(block)
+        if not entries:
+            entries = block.get("children") or []
+        for entry in entries:
+            text = self._extract_text(entry)
+            if text:
+                self.story.append(Paragraph(render_text_with_emojis(text), styles["StructuredSourcesItem"]))
+        self.story.append(Spacer(1, 6))
+
+    def _build_list_flowable(self, block: dict, depth: int) -> ListFlowable | None:
+        entries = self._extract_list_entries(block)
+        if not entries:
+            return None
+        list_items: list[ListItem] = []
+        for entry in entries:
+            entry_flow: list[Any] = []
+            entry_text = self._extract_text(entry)
+            if entry_text:
+                entry_formatted = self._extract_formatted(entry)
+                entry_flow.append(Paragraph(render_text_with_emojis(entry_formatted or entry_text), styles["StructuredListItem"]))
+            if isinstance(entry, dict):
+                nested = self._extract_list_entries(entry)
+                if nested:
+                    nested_flowable = self._build_list_flowable({"items": nested, "ordered": entry.get("ordered")}, depth + 1)
+                    if nested_flowable:
+                        entry_flow.append(nested_flowable)
+            if entry_flow:
+                list_items.append(ListItem(entry_flow))
+        if not list_items:
+            return None
+        ordered = self._determine_ordering(block)
+        return ListFlowable(
+            cast(Iterable, list_items),
+            bulletType="1" if ordered else "bullet",
+            leftIndent=8 * mm * depth,
+            bulletIndent=4 * mm,
+            spaceBefore=8,
+            spaceAfter=8,
+        )
+
+    def _determine_ordering(self, block: dict) -> bool:
+        ordered = block.get("ordered")
+        if isinstance(ordered, str):
+            return ordered.lower() in {"true", "1", "yes", "ordered", "ol"}
+        if isinstance(ordered, bool):
+            return ordered
+        block_type = (block.get("type") or "").lower()
+        return "ordered" in block_type or block_type in {"ol", "ordered_list"}
+
+    def _extract_list_entries(self, block: dict) -> list[Any] | list:
+        entries = block.get("items")
+        if isinstance(entries, list) and entries:
+            return entries
+        entries = block.get("children")
+        if isinstance(entries, list) and entries:
+            return entries
+        entries = block.get("entries")
+        if isinstance(entries, list) and entries:
+            return entries
+        block_type = (block.get("type") or "").lower()
+        if block_type in {"bullet", "list_item"}:
+            text = block.get("text")
+            if text:
+                return [text]
+        return []
+
+    def _increment_section_counter(self, depth: int) -> str:
+        if depth < 1:
+            depth = 1
+        while len(self.section_counters) < depth:
+            self.section_counters.append(0)
+        if len(self.section_counters) > depth:
+            self.section_counters = self.section_counters[:depth]
+        self.section_counters[depth - 1] += 1
+        return ".".join(str(num) for num in self.section_counters if num > 0)
+
+    def _heading_style(self, depth: int) -> ParagraphStyle:
+        if depth <= 1:
+            return styles["CustomHeading1"]
+        if depth == 2:
+            return styles["CustomHeading2"]
+        return styles["CustomHeading3"]
+
+    def _append_paragraph(self, text: str | None, formatted: str | None = None, style: ParagraphStyle | None = None) -> None:
+        if not text and not formatted:
+            return
+        paragraph_style = style or styles["StructuredParagraph"]
+        content = formatted or text or ""
+        markup = self._prepare_inline_markup(content)
+        paragraph = Paragraph(render_text_with_emojis(markup), paragraph_style)
+        self.story.append(paragraph)
+
+    def _prepare_inline_markup(self, content: str) -> str:
+        if not content:
+            return ""
+        return (
+            content.replace("<strong>", "<b>")
+            .replace("</strong>", "</b>")
+            .replace("<em>", "<i>")
+            .replace("</em>", "</i>")
+        )
+
+    def _render_label_paragraph(self, block: dict) -> None:
+        label = block.get("label")
+        formatted_label = block.get("formatted_label")
+        body = block.get("text")
+        formatted_body = block.get("formatted")
+        plain_parts = [part.strip() for part in (label, body) if part and str(part).strip()]
+        formatted_parts = [part for part in (formatted_label, formatted_body) if part]
+        combined_text = " ".join(plain_parts) if plain_parts else None
+        combined_formatted = " ".join(formatted_parts) if formatted_parts else None
+        self._append_paragraph(combined_text, combined_formatted)
+
+    def _extract_text(self, block: Any, keys: tuple[str, ...] = ("text", "title", "content", "description", "label", "name")) -> str:
+        if isinstance(block, str):
+            return block.strip()
+        if not isinstance(block, dict):
+            return ""
+        for key in keys:
+            value = block.get(key)
+            if value:
+                return str(value).strip()
+        return ""
+
+    def _extract_formatted(self, block: Any) -> str | None:
+        if isinstance(block, dict):
+            return block.get("formatted")
+        return None
+
 def _cleanup_files(folder_path: str, delay_minutes: int):
     def delete_files():
         time.sleep(delay_minutes * 60)
@@ -628,14 +1181,33 @@ def _convert_markdown_to_structured(markdown_content):
     if not markdown_content or not isinstance(markdown_content, str):
         return []
     
-    lines = markdown_content.split('\n')
+    lines = markdown_content.splitlines()
     structured = []
-    
-    for line in lines:
-        line = line.strip()
+    i = 0
+
+    def parse_table_row(row_line: str) -> list[str]:
+        cleaned = row_line.strip().strip("|")
+        return [cell.strip() for cell in cleaned.split("|")] if cleaned else []
+
+    while i < len(lines):
+        raw_line = lines[i]
+        line = raw_line.strip()
         if not line:
+            i += 1
             continue
-            
+
+        if line.startswith('|') and i + 1 < len(lines) and TABLE_SEPARATOR_RE.match(lines[i + 1].strip()):
+            rows = [parse_table_row(line)]
+            i += 2
+            while i < len(lines):
+                next_line = lines[i].strip()
+                if not next_line or '|' not in next_line:
+                    break
+                rows.append(parse_table_row(next_line))
+                i += 1
+            structured.append({"type": "table", "data": rows})
+            continue
+
         if line.startswith('# '):
             structured.append({"text": line[2:].strip(), "type": "title"})
         elif line.startswith('## '):
@@ -652,8 +1224,56 @@ def _convert_markdown_to_structured(markdown_content):
             structured.append({"text": line[2:-2].strip(), "type": "bold"})
         else:
             structured.append({"text": line, "type": "paragraph"})
+        i += 1
     
     return structured
+
+
+def convert_structured_to_markdown(content: List[dict]) -> str:
+    """Render structured content into Markdown before PDF generation."""
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+
+    def append_paragraph(text: str) -> None:
+        normalized = (text or "").strip()
+        if normalized:
+            parts.append(normalized)
+
+    def handle_item(item: Any) -> None:
+        if isinstance(item, str):
+            append_paragraph(item)
+            return
+        if isinstance(item, list):
+            for child in item:
+                handle_item(child)
+            return
+        if not isinstance(item, dict):
+            return
+
+        item_type = (item.get("type") or "").strip().lower()
+        text_value = (item.get("text") or item.get("title") or "").strip()
+
+        if item_type == "title":
+            append_paragraph(f"# {text_value}")
+        elif item_type == "section":
+            if text_value:
+                append_paragraph(f"## {text_value}")
+        elif item_type in {"paragraph", "text", "source", "sources", "description"}:
+            append_paragraph(text_value)
+        elif text_value:
+            append_paragraph(text_value)
+
+        children = item.get("children")
+        if isinstance(children, list):
+            for child in children:
+                handle_item(child)
+
+    for entry in content:
+        handle_item(entry)
+
+    return "\n\n".join(parts)
 
 def _create_excel(data: list[list[str]], filename: str, folder_path: str | None = None, title: str | None = None) -> dict:
     log.debug("Creating Excel file with optional template")
@@ -762,7 +1382,56 @@ def _create_csv(data: list[list[str]], filename: str, folder_path: str | None = 
 
     return {"url": _public_url(folder_path, fname), "path": filepath}
 
-def _create_pdf(text: str | list[str], filename: str, folder_path: str | None = None) -> dict:    
+def _build_markdown_story(source: Any) -> list:
+    md_parts: list[str] = []
+
+    def append_paragraph(value: Any) -> None:
+        normalized = (value or "").strip()
+        if normalized:
+            md_parts.append(normalized)
+
+    items = source if isinstance(source, list) else [source]
+    for entry in items:
+        if isinstance(entry, str):
+            append_paragraph(entry)
+            continue
+        if isinstance(entry, dict):
+            t = (entry.get("type") or "").lower()
+            text_value = entry.get("text") or entry.get("title") or ""
+            if t == "title":
+                append_paragraph(f"# {text_value}")
+            elif t == "subtitle":
+                append_paragraph(f"## {text_value}")
+            elif t == "paragraph":
+                append_paragraph(entry.get("text", ""))
+            elif t == "list":
+                append_paragraph("\n".join([f"- {x}" for x in entry.get("items", [])]))
+            elif t in ("image", "image_query"):
+                query = entry.get("query", "")
+                if query:
+                    append_paragraph(f"![Image](image_query: {query})")
+            else:
+                append_paragraph(text_value)
+        else:
+            append_paragraph(str(entry))
+
+    md_text = "\n\n".join(md_parts) or ""
+
+    def replace_image_query(match: re.Match) -> str:
+        query = match.group(1).strip()
+        image_url = search_image(query)
+        if image_url:
+            return f'\n\n<img src="{image_url}" alt="Image: {query}" />\n\n'
+        return ""
+
+    md_text = re.sub(r'!\[[^\]]*\]\(\s*image_query:\s*([^)]+)\)', replace_image_query, md_text)
+    html = markdown2.markdown(md_text, extras=['fenced-code-blocks','tables','break-on-newline','cuddled-lists'])
+    soup = BeautifulSoup(html, "html.parser")
+    story = render_html_elements(soup) or [Paragraph("Empty Content", styles["CustomNormal"])]
+    return story
+
+
+def _create_pdf(content: Any, filename: str, folder_path: str | None = None) -> dict:    
     log.debug("Creating PDF file")
     if folder_path is None:
         folder_path = _generate_unique_folder()
@@ -773,47 +1442,19 @@ def _create_pdf(text: str | list[str], filename: str, folder_path: str | None = 
     else:
         filepath, fname = _generate_filename(folder_path, "pdf")
 
-    md_parts = []
-    if isinstance(text, list):
-        for item in text:
-            if isinstance(item, str):
-                md_parts.append(item)
-            elif isinstance(item, dict):
-                t = item.get("type")
-                if t == "title":
-                    md_parts.append(f"# {item.get('text','')}")
-                elif t == "subtitle":
-                    md_parts.append(f"## {item.get('text','')}")
-                elif t == "paragraph":
-                    md_parts.append(item.get("text",""))
-                elif t == "list":
-                    md_parts.append("\n".join([f"- {x}" for x in item.get("items",[])]))
-                elif t in ("image","image_query"):
-                    query = item.get("query","")
-                    if query:
-                        md_parts.append(f"![Image](image_query: {query})")
+    normalized_blocks = normalize_content_for_export(content)
+    if normalized_blocks:
+        story = render_structured_content(normalized_blocks)
     else:
-        md_parts = [str(text or "")]
-        
-    md_text = "\n\n".join(md_parts)    
-   
-    def replace_image_query(match):
-        query = match.group(1).strip()
-        image_url = search_image(query)
-        return f'\n\n<img src="{image_url}" alt="Image: {query}" />\n\n' if image_url else ""
+        story = _build_markdown_story(content)
 
-    md_text = re.sub(r'!\[[^\]]*\]\(\s*image_query:\s*([^)]+)\)', replace_image_query, md_text)
-    html = markdown2.markdown(md_text, extras=['fenced-code-blocks','tables','break-on-newline','cuddled-lists'])
-    soup = BeautifulSoup(html, "html.parser")
-    story = render_html_elements(soup) or [Paragraph("Empty Content", styles["CustomNormal"])]
-
-    doc = SimpleDocTemplate(filepath, topMargin=72, bottomMargin=72, leftMargin=72, rightMargin=72)
+    doc = SimpleDocTemplate(filepath, topMargin=54, bottomMargin=54, leftMargin=54, rightMargin=54)
     try:
         doc.build(story)
     except Exception as e:
         log.error(f"Error building PDF {fname}: {e}", exc_info=True)
-        doc2 = SimpleDocTemplate(filepath)
-        doc2.build([Paragraph("Error in PDF generation", styles["CustomNormal"])])
+        fallback = SimpleDocTemplate(filepath)
+        fallback.build([Paragraph("Error in PDF generation", styles["CustomNormal"])])
 
     return {"url": _public_url(folder_path, fname), "path": filepath}
 
@@ -1072,6 +1713,8 @@ def _create_word(content: list[dict] | str, filename: str, folder_path: str | No
 
     if isinstance(content, str):
         content = _convert_markdown_to_structured(content)
+    elif isinstance(content, dict):
+        content = [content]
     elif not isinstance(content, list):
         content = []
 
@@ -1127,132 +1770,177 @@ def _create_word(content: list[dict] | str, filename: str, folder_path: str | No
         title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
         log.debug("Document title added")
 
-    for item in content or []:
-        if isinstance(item, str):
-            doc.add_paragraph(item)
-        elif isinstance(item, dict):
-            if item.get("type") == "image_query":
-                new_item = {
-                    "type": "image",
-                    "query": item.get("query")
-                }
-                image_query = new_item.get("query")
-                if image_query:
-                    log.debug(f"Image search for the query : {image_query}")
-                    image_url = search_image(image_query)
-                    if image_url:
-                        response = requests.get(image_url)
-                        image_data = BytesIO(response.content)
-                        doc.add_picture(image_data, width=Inches(6))
-                        log.debug("Image successfully added")
-                    else:
-                        log.warning(f"Image search for : '{image_query}'")
-            elif "type" in item:
-                item_type = item.get("type")
-                if item_type == "title":
-                    paragraph = doc.add_paragraph(item.get("text", ""))
-                    try:
-                        paragraph.style = doc.styles['Heading 1']
-                    except KeyError:
-                        run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
-                        run.font.size = DocxPt(18)
-                        run.font.bold = True
-                    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    log.debug("Title added")
-                elif item_type == "subtitle":
-                    paragraph = doc.add_paragraph(item.get("text", ""))
-                    try:
-                        paragraph.style = doc.styles['Heading 2']
-                    except KeyError:
-                        run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
-                        run.font.size = DocxPt(16)
-                        run.font.bold = True
-                    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    log.debug("Subtitle added")
-                elif item_type == "paragraph":
-                    doc.add_paragraph(item.get("text", ""))
-                    log.debug("Paragraph added")
-                elif item_type == "list":
-                    items = item.get("items", [])
-                    for i, item_text in enumerate(items):
-                        paragraph = doc.add_paragraph(item_text)
-                        try:
-                            paragraph.style = doc.styles['List Bullet']
-                        except KeyError:
-                            paragraph.style = doc.styles['Normal']
-                    log.debug("List added")
-                elif item_type == "image":
-                    image_query = item.get("query")
-                    if image_query:
-                        log.debug(f"Image search for the query : {image_query}")
-                        image_url = search_image(image_query)
-                        if image_url:
-                            response = requests.get(image_url)
-                            image_data = BytesIO(response.content)
-                            doc.add_picture(image_data, width=Inches(6))
-                            log.debug("Image successfully added")
-                        else:
-                            log.warning(f"Image search for : '{image_query}'")
-                elif item_type == "table":
-                    data = item.get("data", [])
-                    if data:
-                        template_table_style = None
-                        if use_template and DOCX_TEMPLATE:
-                            try:
-                                for table in DOCX_TEMPLATE.tables:
-                                    if table.style:
-                                        template_table_style = table.style
-                                        break
-                            except Exception:
-                                pass
-                        
-                        table = doc.add_table(rows=len(data), cols=len(data[0]) if data else 0)
-                        
-                        if template_table_style:
-                            try:
-                                table.style = template_table_style
-                                log.debug(f"Applied template table style: {template_table_style.name}")
-                            except Exception as e:
-                                log.debug(f"Could not apply template table style: {e}")
-                        else:
-                            try:
-                                for style_name in ['Table Grid', 'Light Grid Accent 1', 'Medium Grid 1 Accent 1', 'Light List Accent 1']:
-                                    try:
-                                        table.style = doc.styles[style_name]
-                                        log.debug(f"Applied built-in table style: {style_name}")
-                                        break
-                                    except KeyError:
-                                        continue
-                            except Exception as e:
-                                log.debug(f"Could not apply any table style: {e}")
-                        
-                        for i, row in enumerate(data):
-                            for j, cell in enumerate(row):
-                                cell_obj = table.cell(i, j)
-                                cell_obj.text = str(cell)
-                                
-                                if i == 0:
-                                    for paragraph in cell_obj.paragraphs:
-                                        for run in paragraph.runs:
-                                            run.font.bold = True
-                                        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                        
-                        if not template_table_style:
-                            try:
-                                tbl = table._tbl
-                                tblPr = tbl.tblPr
-                                tblBorders = parse_xml(r'<w:tblBorders {}><w:top w:val="single" w:sz="4" w:space="0" w:color="000000"/><w:left w:val="single" w:sz="4" w:space="0" w:color="000000"/><w:bottom w:val="single" w:sz="4" w:space="0" w:color="000000"/><w:right w:val="single" w:sz="4" w:space="0" w:color="000000"/><w:insideH w:val="single" w:sz="4" w:space="0" w:color="000000"/><w:insideV w:val="single" w:sz="4" w:space="0" w:color="000000"/></w:tblBorders>'.format(nsdecls('w')))
-                                tblPr.append(tblBorders)
-                            except Exception as e:
-                                log.debug(f"Could not add table borders: {e}")
-                        
-                        log.debug("Table added with improved styling")
-            elif "text" in item:
-                doc.add_paragraph(item["text"])
-                log.debug("Paragraph added")
-    
+    normalized_content = normalize_content_for_export(content)
+    if normalized_content:
+        _render_structured_docx(doc, normalized_content)
+    else:
+        _add_docx_paragraph(doc, "")
+
     doc.save(filepath)
     return {"url": _public_url(folder_path, fname), "path": filepath}
+
+
+def _render_structured_docx(doc: Document, blocks: list[Any], depth: int = 1) -> None:
+    for block in blocks:
+        if isinstance(block, str):
+            _add_docx_paragraph(doc, block)
+            continue
+        if not isinstance(block, dict):
+            continue
+
+        block_type = (block.get("type") or "").strip().lower()
+        text = _extract_block_text(block)
+
+        if block_type == "title":
+            _add_docx_heading(doc, text, level=1, centered=True)
+            _render_structured_docx(doc, block.get("children") or [], depth)
+            continue
+
+        if block_type == "section":
+            _add_docx_heading(doc, text or block.get("title") or "Section", level=min(depth + 1, 3))
+            _render_structured_docx(doc, block.get("children") or [], depth + 1)
+            continue
+
+        if block_type in {"paragraph", "text", "body", "description", "summary"} and text:
+            _add_docx_paragraph(doc, text, block.get("formatted"))
+            continue
+        if block_type == "label_paragraph":
+            label_html = block.get("formatted_label") or block.get("label")
+            body_html = block.get("formatted") or block.get("text")
+            formatted_content = " ".join(part for part in (label_html, body_html) if part)
+            plain_content = " ".join(part.strip() for part in (block.get("label"), block.get("text")) if part and str(part).strip())
+            _add_docx_paragraph(doc, plain_content, formatted_content or None)
+            continue
+        elif block_type in {"sources", "source", "references"}:
+            _add_docx_heading(doc, text or "Sources", level=min(depth + 1, 3))
+            entries = block.get("children") or block.get("items") or []
+            for entry in entries:
+                entry_text = _extract_block_text(entry)
+                entry_formatted = entry.get("formatted") if isinstance(entry, dict) else None
+                if entry_text:
+                    para = doc.add_paragraph()
+                    _apply_formatted_html_to_paragraph(para, entry_formatted, entry_text)
+                    para.paragraph_format.space_before = DocxPt(2)
+                    para.paragraph_format.space_after = DocxPt(2)
+                    para_format = para.paragraph_format
+                    para_format.left_indent = DocxPt(12)
+                    run = para.runs[0] if para.runs else para.add_run()
+                    run.italic = True
+            continue
+        elif "list" in block_type or "bullet" in block_type:
+            entries = block.get("items") or block.get("children") or block.get("entries") or []
+            if not entries and block_type in {"bullet", "list_item"}:
+                text_value = block.get("text")
+                if text_value:
+                    entries = [text_value]
+            if not entries:
+                continue
+            for entry in entries:
+                entry_text = _extract_block_text(entry)
+                entry_formatted = entry.get("formatted") if isinstance(entry, dict) else None
+                if not entry_text:
+                    continue
+                paragraph = doc.add_paragraph()
+                try:
+                    paragraph.style = doc.styles['List Bullet']
+                except KeyError:
+                    paragraph.style = doc.styles['Normal']
+                paragraph.paragraph_format.left_indent = DocxPt(12 * depth)
+                paragraph.paragraph_format.space_before = DocxPt(2)
+                paragraph.paragraph_format.space_after = DocxPt(2)
+                _apply_formatted_html_to_paragraph(paragraph, entry_formatted, entry_text)
+                if isinstance(entry, dict) and entry.get("children"):
+                    _render_structured_docx(doc, entry.get("children"), depth + 1)
+            continue
+        if block_type == "table":
+            table_data = block.get("data") or []
+            if table_data:
+                cols = max((len(row) for row in table_data), default=0)
+                table = doc.add_table(rows=len(table_data), cols=cols)
+                for i, row in enumerate(table_data):
+                    for j in range(cols):
+                        cell_text = row[j] if j < len(row) else ""
+                        cell = table.cell(i, j)
+                        cell.text = cell_text
+                        if i == 0:
+                            for paragraph in cell.paragraphs:
+                                for run in paragraph.runs:
+                                    run.font.bold = True
+                                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                doc.add_paragraph()
+            continue
+        elif text:
+            _add_docx_paragraph(doc, text)
+
+        if block.get("children"):
+            _render_structured_docx(doc, block.get("children"), depth + 1)
+def _add_docx_paragraph(doc: Document, text: str, formatted: str | None = None) -> None:
+    if not text and not formatted:
+        return
+    paragraph = doc.add_paragraph()
+    _apply_formatted_html_to_paragraph(paragraph, formatted, text)
+    try:
+        paragraph.style = doc.styles['Normal']
+    except KeyError:
+        pass
+    paragraph.paragraph_format.space_before = DocxPt(4)
+    paragraph.paragraph_format.space_after = DocxPt(6)
+
+
+def _apply_formatted_html_to_paragraph(paragraph, formatted_html: str | None, fallback_text: str) -> None:
+    while paragraph.runs:
+        paragraph.runs[0]._element.getparent().remove(paragraph.runs[0]._element)
+    content = formatted_html or fallback_text or ""
+    if not content:
+        return
+    soup = BeautifulSoup(content, "html.parser")
+
+    def recurse(node, bold=False, italic=False):
+        for child in node.children:
+            if isinstance(child, str):
+                if child:
+                    run = paragraph.add_run(child)
+                    run.bold = bold
+                    run.italic = italic
+            elif child.name in {"strong", "b"}:
+                recurse(child, bold=True, italic=italic)
+            elif child.name in {"em", "i"}:
+                recurse(child, bold=bold, italic=True)
+            elif child.name == "br":
+                paragraph.add_run().add_break()
+            else:
+                recurse(child, bold=bold, italic=italic)
+
+    recurse(soup)
+
+
+def _add_docx_heading(doc: Document, text: str, level: int = 2, centered: bool = False) -> None:
+    if not text:
+        return
+    paragraph = doc.add_paragraph(text)
+    style_name = f"Heading {min(max(level, 1), 3)}"
+    try:
+        paragraph.style = doc.styles[style_name]
+    except KeyError:
+        run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
+        run.font.size = DocxPt(18 if level <= 2 else 14)
+        run.font.bold = True
+    if centered:
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    paragraph.paragraph_format.space_before = DocxPt(6)
+    paragraph.paragraph_format.space_after = DocxPt(6)
+
+
+def _extract_block_text(block: Any) -> str:
+    if isinstance(block, str):
+        return block.strip()
+    if not isinstance(block, dict):
+        return ""
+    for key in ("text", "title", "content", "description", "label", "name"):
+        value = block.get(key)
+        if value:
+            return str(value).strip()
+    return ""
 
 def _create_raw_file(content: str, filename: str | None, folder_path: str | None = None) -> dict:
     log.debug("Creating raw file")
@@ -2657,7 +3345,7 @@ async def create_file(data: dict, persistent: bool = PERSISTENT_FILES) -> dict:
     title = data.get("title")
 
     if format_type == "pdf":
-        result = _create_pdf(content if isinstance(content, list) else [str(content or "")], filename, folder_path=folder_path)
+        result = _create_pdf(content if content is not None else "", filename, folder_path=folder_path)
     elif format_type == "pptx":
         result = _create_presentation(data.get("slides_data", []), filename, folder_path=folder_path, title=title)
     elif format_type == "docx":
@@ -2690,7 +3378,7 @@ async def generate_and_archive(files_data: list[dict], archive_format: str = "zi
 
         try:
             if fmt == "pdf":
-                res = _create_pdf(content if isinstance(content, list) else [str(content or "")], fname, folder_path=folder_path)
+                res = _create_pdf(content if content is not None else "", fname, folder_path=folder_path)
             elif fmt == "pptx":
                 res = _create_presentation(file_info.get("slides_data", []), fname, folder_path=folder_path, title=title)
             elif fmt == "docx":

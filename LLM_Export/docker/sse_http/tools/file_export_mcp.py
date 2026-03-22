@@ -674,7 +674,31 @@ def _create_excel(data: list[list[str]], filename: str, folder_path: str | None 
     else:
         filepath, fname = _generate_filename(folder_path, "xlsx")
 
-    if XLSX_TEMPLATE:
+    # Detect structured content (list of dicts with 'type' field)
+    is_structured = (
+        isinstance(data, list)
+        and data
+        and isinstance(data[0], dict)
+        and "type" in data[0]
+    )
+    
+    # Detect raw 2D matrix (list of lists with primitive values)
+    is_raw_matrix = (
+        isinstance(data, list)
+        and data
+        and isinstance(data[0], list)
+        and all(
+            isinstance(cell, (str, int, float, bool, type(None)))
+            for row in data[:5]
+            for cell in row[:10]
+        )
+    )
+    
+    # For raw 2D matrices and structured content: create clean workbook
+    if is_raw_matrix or is_structured:
+        log.debug("Raw 2D matrix or structured content detected, creating clean workbook")
+        wb = Workbook()
+    elif XLSX_TEMPLATE:
         try:
             log.debug("Loading XLSX template...")
             wb = load_workbook(XLSX_TEMPLATE_PATH) 

@@ -115,7 +115,8 @@ def file_export_module(tmp_path_factory):
     os.environ.setdefault("LOG_LEVEL", "DEBUG")
     export_dir = tmp_path_factory.mktemp("export_test")
     os.environ["FILE_EXPORT_DIR"] = str(export_dir)
-    module = importlib.import_module("file_export_mcp")
+    # Import from the tools package to handle relative imports correctly
+    module = importlib.import_module("LLM_Export.tools.file_export_mcp")
     return module
 
 

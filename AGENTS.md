@@ -13,10 +13,25 @@ MCPO-File-Generation-Tool/
 │   │   ├── file_export_mcp.py    # Main MCP server (FastMCP)
 │   │   ├── file_export_server.py # Static file serving (FastAPI)
 │   │   └── __init__.py
+│   ├── shared/                    # Shared utilities and constants
+│   │   ├── constants.py          # Environment-based configuration
+│   │   ├── utils.py              # Common utility functions
+│   │   └── styles.py             # PDF styling definitions
+│   ├── exporters/                 # Format-specific exporters
+│   │   ├── docx_exporter.py      # Word document generation
+│   │   ├── pdf_exporter.py       # PDF generation (ReportLab)
+│   │   ├── xlsx_exporter.py      # Excel generation
+│   │   └── pptx_exporter.py      # PowerPoint generation
+│   ├── processing/                # Content processing pipeline
+│   │   ├── block_utils.py        # Markdown block parsing
+│   │   ├── normalization.py      # Content normalization
+│   │   └── text_utils.py         # Text processing helpers
 │   ├── functions/                 # Filter functions for Open WebUI
 │   │   └── files_metadata_injector.py
 │   ├── templates/                 # Document templates (.docx, .pptx, .xlsx)
 │   └── output/                    # Generated files directory
+├── tests/                         # Test suite
+│   └── test_export_content_regression.py
 ├── Documentation/                 # User documentation
 ├── config.json                    # MCP server configuration template
 └── .github/workflows/containers.yaml  # CI/CD pipeline
@@ -30,22 +45,7 @@ MCPO-File-Generation-Tool/
 pip install -r LLM_Export/requirements.txt
 ```
 
-**Required packages:**
-- openpyxl (Excel file generation)
-- reportlab (PDF generation)
-- mcp (Model Context Protocol)
-- py7zr (7z archive support)
-- fastapi (HTTP server framework)
-- uvicorn (ASGI server)
-- python-multipart (multipart/form-data handling)
-- markdown2 (Markdown to HTML conversion)
-- beautifulsoup4 (HTML parsing)
-- emoji (Emoji support)
-- python-pptx (PowerPoint generation)
-- python-docx (Word document generation)
-- requests (HTTP client)
-- lxml (XML processing)
-- PIL/Pillow (Image processing)
+**Required packages:** openpyxl, reportlab, mcp, py7zr, fastapi, uvicorn, python-multipart, markdown2, beautifulsoup4, emoji, python-pptx, python-docx, requests, lxml, PIL/Pillow
 
 ### Start File Export Server
 
@@ -54,7 +54,7 @@ export FILE_EXPORT_DIR=/path/to/output
 python LLM_Export/tools/file_export_server.py
 ```
 
-Or with environment variables:
+Or:
 ```bash
 FILE_EXPORT_DIR=/path/to/output uvicorn LLM_Export.tools.file_export_server:app --host 0.0.0.0 --port 9003
 ```
@@ -62,8 +62,7 @@ FILE_EXPORT_DIR=/path/to/output uvicorn LLM_Export.tools.file_export_server:app 
 ### Start MCPO Server
 
 ```bash
-cd LLM_Export
-python -m tools.file_export_mcp
+cd LLM_Export && python -m tools.file_export_mcp
 ```
 
 For development with auto-reload:
@@ -73,28 +72,29 @@ python -m uvicorn tools.file_export_mcp:mcp.app --host 0.0.0.0 --port 8000 --rel
 
 ## Test Commands
 
-**No formal test suite exists.** The project is currently production-only without automated tests.
+### Run All Tests
 
-### Manual Testing
-
-1. **Start the file server:**
-   ```bash
-   FILE_EXPORT_DIR=/tmp/test-output python LLM_Export/tools/file_export_server.py
-   ```
-
-2. **Start the MCPO server (in another terminal):**
-   ```bash
-   cd LLM_Export
-   FILE_EXPORT_BASE_URL=http://localhost:9003/files FILE_EXPORT_DIR=/tmp/test-output python -m tools.file_export_mcp
-   ```
-
-3. **Verify file generation** by using Open WebUI or calling the MCP server endpoints.
-
-### Docker Testing
-
-Build and run with docker-compose:
 ```bash
-docker-compose -f LLM_Export/Example_docker-compose.yaml up -d
+cd LLM_Export && pytest ../tests/ -v
+```
+
+### Run Single Test
+
+```bash
+# Run by test name
+pytest ../tests/ -v -k "test_a_pdf_export"
+
+# Run specific test
+pytest ../tests/test_export_content_regression.py::test_a_pdf_export_with_string_markdown -v
+
+# Run with debug logging
+pytest ../tests/ -v -s --log-cli-level=DEBUG
+```
+
+### Test Coverage
+
+```bash
+pytest ../tests/ --cov=../LLM_Export --cov-report=term-missing -v
 ```
 
 ## Code Style Guidelines
@@ -103,43 +103,39 @@ docker-compose -f LLM_Export/Example_docker-compose.yaml up -d
 
 - **Indentation**: 4 spaces per level
 - **Line length**: 120 characters maximum
-- **Imports**: Standard library first, then third-party, then local imports
-- **Naming**:
-  - Functions/variables: `snake_case`
-  - Classes: `PascalCase`
-  - Constants: `UPPER_SNAKE_CASE`
-  - Private: `_leading_underscore`
+- **Imports**: Standard library first, then third-party, then local imports (relative preferred)
+- **Naming**: Functions/variables `snake_case`, Classes `PascalCase`, Constants `UPPER_SNAKE_CASE`, Private `_leading_underscore`
+- **Internal exports**: Define `__all__` list in modules
 
 ### Import Organization
 
 ```python
 # 1. Standard library
-import re
 import os
-import json
-import uuid
-import datetime
+import re
 import logging
 from pathlib import Path
+from typing import Any, Optional, List, Dict
 
 # 2. Third-party
 import requests
 from mcp.server.fastmcp import FastMCP
 from fastapi import FastAPI
+from docx import Document
 
-# 3. Local imports
-from tools.file_export_mcp import some_function
+# 3. Local imports (relative first)
+try:
+    from ..shared.constants import EXPORT_DIR, BASE_URL
+    from ..shared.utils import _generate_unique_folder
+except ImportError:
+    from shared.constants import EXPORT_DIR, BASE_URL
+    from shared.utils import _generate_unique_folder
 ```
 
 ### Logging
 
 - Use module-level logger: `log = logging.getLogger(__name__)`
-- Log levels: DEBUG for development, INFO for production
-- Always log at appropriate levels:
-  - `log.debug()` for detailed diagnostic info
-  - `log.info()` for normal operations
-  - `log.warning()` for recoverable issues
-  - `log.error()` for errors with stack traces
+- Log at appropriate levels: `log.debug()` for diagnostics, `log.info()` for operations, `log.warning()` for issues, `log.error()` for errors with `exc_info=True`
 
 ### Error Handling
 
@@ -167,46 +163,43 @@ def create_excel(
 - Environment variables are primary configuration method
 - Default values provided for all env vars
 - Configuration keys in `config.json` use snake_case
+- All constants defined in `shared/constants.py`
 
 ### File Naming
 
 - Python modules: `snake_case.py`
 - Templates: `Default_Template.{ext}` (docx, pptx, xlsx)
 - Generated files: `export_{datetime}.{ext}` or user-provided filename
+- Test files: `test_*.py`
 
 ### HTML/Markdown Processing
 
-- Use `markdown2` for Markdown to HTML conversion
+- Use `markdown2` for Markdown to HTML conversion with extras
 - Use `BeautifulSoup` for HTML parsing
 - Render emojis with `emoji.emojize(text, language="alias")`
 
 ### PDF Generation
 
-- Use ReportLab with custom styles
+- Use ReportLab with custom styles from `shared/styles.py`
 - Define custom styles in `styles` dict
 - Use `SimpleDocTemplate` for document layout
 - Handle images with `ReportLabImage`
+- Use `Table` and `TableStyle` for tabular data
 
 ### Word/PPTX Generation
 
-- Use python-docx for .docx files
+- Use python-docx for .docx files with template support
 - Use python-pptx for .pptx files
 - Support template-based generation
-- Dynamic font sizing for content
+- Dynamic font sizing for content using `dynamic_font_size`
 
 ## Docker Guidelines
 
 ### Environment Variables
 
-**Required for all deployments:**
-- `FILE_EXPORT_BASE_URL`: URL to file export server (default: `http://localhost:9003/files`)
-- `FILE_EXPORT_DIR`: Output directory (default: `PYTHONPATH/output`)
+**Required:** `FILE_EXPORT_BASE_URL` (default: `http://localhost:9003/files`), `FILE_EXPORT_DIR` (default: `PYTHONPATH/output`)
 
-**Optional:**
-- `PERSISTENT_FILES`: Keep files after download (default: `false`)
-- `FILES_DELAY`: Cleanup delay in minutes (default: `60`)
-- `LOG_LEVEL`: DEBUG, INFO, WARNING, ERROR, CRITICAL (default: `INFO`)
-- `IMAGE_SOURCE`: "pexels", "unsplash", or "local_sd" (default: `unsplash`)
+**Optional:** `PERSISTENT_FILES` (default: `false`), `FILES_DELAY` (default: `60`), `LOG_LEVEL` (default: `INFO`), `IMAGE_SOURCE` (default: `unsplash`)
 
 ### Image Sources
 
@@ -234,18 +227,19 @@ def create_excel(
 
 ### Adding a New File Type
 
-1. Create `_create_{ext}` function in `file_export_mcp.py`
-2. Implement error handling with try/except
+1. Create `_create_{ext}` function in `exporters/{ext}_exporter.py`
+2. Implement error handling with try/except and logging
 3. Use `_generate_unique_folder()` for output directory
 4. Return `{"url": ..., "path": ...}` dict
-5. Update `_public_url()` if URL construction is custom
+5. Update `exporters/__init__.py` to re-export the function
+6. Add test in `tests/test_export_content_regression.py`
 
 ### Modifying Templates
 
 1. Place templates in `LLM_Export/templates/`
 2. Template names: `Default_Template.{ext}`
 3. Templates are auto-loaded on startup
-4. Gracefully handle template load failures
+4. Gracefully handle template load failures with try/except
 
 ## Performance Considerations
 
@@ -253,6 +247,24 @@ def create_excel(
 - File cleanup runs in background threads
 - Use BytesIO for in-memory image processing
 - Generate unique folder names with UUID + timestamp
+- Use relative imports within LLM_Export package
+
+## Context Usage Rules
+
+- Do NOT treat test inputs, sample outputs, or user prompts as source-of-truth for implementation.
+- Test data is for validation only and must not be embedded into logic.
+- When implementing changes, focus only on:
+  - source code files
+  - relevant modules
+  - minimal required context
+
+- If test data is present in the conversation:
+  - use it only to understand the issue
+  - do NOT copy or depend on it in the implementation
+
+- Prefer minimal context loading:
+  - do not scan unrelated files
+  - do not re-read large test payloads unless strictly necessary
 
 ## Security
 
@@ -260,18 +272,22 @@ def create_excel(
 - MCPO API key for server authentication (optional)
 - Never commit API keys or secrets
 - Use environment variables for sensitive data
+- Validate all user-provided file paths
 
 ## Documentation
 
 - User docs in `Documentation/` directory
 - Code comments for complex logic
 - Log messages for debugging context
+- Docstrings for all public functions
 
 ## Notes for Agentic Agents
 
-1. **Always test changes manually** - no automated tests exist
+1. **Always test changes manually** - use pytest with `-k` flag for single tests
 2. **Respect existing patterns** - follow established conventions exactly
 3. **Use environment variables** - never hardcode configuration
 4. **Log appropriately** - add debug logs for new functionality
 5. **Handle edge cases** - empty data, missing files, network errors
 6. **Docker-first** - most deployments use Docker Compose
+7. **Relative imports** - prefer `from ..module import func` over absolute
+8. **Test-first** - add regression tests before fixing bugs

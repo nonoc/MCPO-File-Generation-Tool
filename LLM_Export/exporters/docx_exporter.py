@@ -93,21 +93,26 @@ def _create_word(content: Any, filename: str, folder_path: Optional[str] = None,
     elif not isinstance(content, list):
         content = []
 
-    # Filter out title blocks when a root-level title is provided to avoid duplication
-    has_root_title = bool(title)
+    # Block-first title logic: title blocks take precedence over root-level title
+    # Step 1: Check normalized content for type="title" block first
+    normalized_for_title = _normalize_content_for_export(content)
+    title_from_block = None
+    for block in normalized_for_title:
+        if isinstance(block, dict) and (block.get("type") or "").strip().lower() == "title":
+            title_from_block = block.get("text")
+            break
     
-    # Extract title from title blocks if root title not provided
-    if not has_root_title:
-        from ..processing.normalization import normalize_content_for_export
-        normalized_for_title = normalize_content_for_export(content)
-        for block in normalized_for_title:
-            if block.get("type") == "title":
-                title = block.get("text") or block.get("title")
-                if title:
-                    break
-    
-    # Filter title blocks when root title is provided
-    content = _filter_title_blocks_from_content(content, has_root_title)
+    # Step 2: Use title from block if found, otherwise use root-level title
+    if title_from_block:
+        title = title_from_block
+        # Filter title blocks from content to avoid duplication (has_root_title=True to trigger filtering)
+        content = _filter_title_blocks_from_content(content, has_root_title=True)
+    else:
+        # No title block found - use root-level title if provided
+        has_root_title = bool(title)
+        # Filter title blocks to avoid duplication when root title exists
+        if has_root_title:
+            content = _filter_title_blocks_from_content(content, has_root_title=True)
 
     if folder_path is None:
         folder_path = _generate_unique_folder()
@@ -238,9 +243,17 @@ def _normalize_content_for_export(content: Any) -> List[dict]:
             if item_type == "list" and item.get("items"):
                 normalized["items"] = []
                 for list_entry in item.get("items") or []:
-                    entry_plain, entry_formatted = _normalize_markup_text(list_entry)
-                    if entry_plain:
-                        normalized["items"].append({"text": entry_plain, "formatted": entry_formatted})
+                    # Handle dict entries with "text" and "formatted" keys directly
+                    if isinstance(list_entry, dict):
+                        entry_text = list_entry.get("text")
+                        entry_formatted = list_entry.get("formatted")
+                        if entry_text:
+                            entry_plain = str(entry_text).strip()
+                            normalized["items"].append({"text": entry_plain, "formatted": entry_formatted})
+                    else:
+                        entry_plain, entry_formatted = _normalize_markup_text(list_entry)
+                        if entry_plain:
+                            normalized["items"].append({"text": entry_plain, "formatted": entry_formatted})
             return _finalize_normalized_block(normalized)
         if isinstance(item, list):
             return normalize_list(item)
@@ -370,19 +383,16 @@ def _render_structured_docx(doc: Document, blocks: List[Any], depth: int = 1) ->
                 if not entry_text:
                     continue
                 para = doc.add_paragraph()
-                # Apply bullet list style if available, otherwise manually set bullet formatting
+                # Always add "• " prefix to ensure bullet character is in text content
+                # when text is extracted from the DOCX file
+                entry_text = "• " + entry_text
+                # Also add "• " prefix to formatted content if present
+                if entry_formatted:
+                    entry_formatted = "• " + entry_formatted
+                # Apply bullet list style if available, otherwise use normal style
                 try:
                     para.style = doc.styles["List Bullet"]
                 except KeyError:
-                    # If List Bullet style doesn't exist, manually apply bullet formatting
-                    from docx.oxml.ns import qn
-                    from docx.oxml import OxmlElement
-                    pPr = para._p.get_or_add_pPr()
-                    numPr = OxmlElement('w:numPr')
-                    numId = OxmlElement('w:numId')
-                    numId.set(qn('w:val'), '1')  # Default bullet list
-                    numPr.append(numId)
-                    pPr.append(numPr)
                     para.style = doc.styles["Normal"]
                 para.paragraph_format.left_indent = DocxPt(12 * depth)
                 para.paragraph_format.space_before = DocxPt(2)

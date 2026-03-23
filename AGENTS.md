@@ -97,6 +97,24 @@ pytest ../tests/ -v -s --log-cli-level=DEBUG
 pytest ../tests/ --cov=../LLM_Export --cov-report=term-missing -v
 ```
 
+## Source of truth
+
+Primary code:
+- LLM_Export/tools
+- LLM_Export/exporters
+- LLM_Export/functions
+- LLM_Export/processing
+- LLM_Export/shared
+
+## Docker folders
+
+- LLM_Export/docker/**
+
+These are deployment copies.
+Do NOT modify them unless explicitly requested.
+
+When duplicate files exist, always use the non-docker version.
+
 ## Code Style Guidelines
 
 ### Python Style (PEP 8)

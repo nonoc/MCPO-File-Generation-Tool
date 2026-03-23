@@ -350,8 +350,8 @@ class _StructuredContentRenderer:
         formatted_label = block.get("formatted_label")
         body = block.get("text")
         formatted_body = block.get("formatted")
-        plain_parts = [part.strip() for part in (label, body) if part and str(part).strip()]
-        formatted_parts = [part for part in (formatted_label, formatted_body) if part]
+        plain_parts = [str(part).strip() for part in (label, body) if part and str(part).strip()]
+        formatted_parts = [str(part) for part in (formatted_label, formatted_body) if part]
         combined_text = " ".join(plain_parts) if plain_parts else None
         combined_formatted = " ".join(formatted_parts) if formatted_parts else None
         self._append_paragraph(combined_text, combined_formatted)
@@ -373,7 +373,9 @@ class _StructuredContentRenderer:
     def _extract_formatted(self, block: Any) -> str | None:
         """Extract formatted content from a block."""
         if isinstance(block, dict):
-            return block.get("formatted")
+            value = block.get("formatted")
+            if value is not None:
+                return str(value)
         return None
 
     def _create_table(self, table_data):
